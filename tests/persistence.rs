@@ -3,10 +3,10 @@ mod common;
 use std::path::PathBuf;
 
 use common::*;
-use pixsort::db::{PlanDb, SessionStatus};
+use pixsort::db::{PlanDb, SessionMode, SessionStatus};
 use pixsort::jobs::ProgressReporter;
 use pixsort::model::{GroupDecision, GroupKind, ItemStatus, JobControl, OpType, RootKind};
-use pixsort::{executor, fsops, import, planner};
+use pixsort::{analysis, executor, fsops, import, planner};
 
 fn run_import(project: &TestProject) -> pixsort::model::ImportSummary {
     let control = JobControl::new();
@@ -18,6 +18,92 @@ fn apply(project: &TestProject) -> anyhow::Result<pixsort::model::ApplyReport> {
     let control = JobControl::new();
     let (reporter, _rx) = ProgressReporter::channel();
     executor::apply_plan(&project.settings, true, &control, &reporter)
+}
+
+fn run_analysis(project: &TestProject) -> pixsort::model::AnalysisSummary {
+    let control = JobControl::new();
+    let (reporter, _rx) = ProgressReporter::channel();
+    analysis::run_analysis(&project.settings, &control, &reporter).unwrap()
+}
+
+#[test]
+fn unwritable_trash_is_reported_before_touching_the_archive() {
+    let project = TestProject::new();
+    // Two exact duplicates in the archive produce a MOVE_TO_TRASH operation,
+    // so the plan genuinely needs the trash folder.
+    let bytes = encode_png(&test_image(160, 120), None);
+    write_file(&project.archive.join("2020").join("a.png"), &bytes);
+    write_file(&project.archive.join("2020").join("b.png"), &bytes);
+    run_analysis(&project);
+
+    let bad_trash = project.dir.path().join("trash-is-a-file");
+    std::fs::write(&bad_trash, b"not a directory").unwrap();
+    let mut settings = project.settings.clone();
+    settings.trash_dir = Some(bad_trash);
+
+    let control = JobControl::new();
+    let (reporter, _rx) = ProgressReporter::channel();
+    let err = executor::apply_plan(&settings, true, &control, &reporter).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("trash folder is not writable"),
+        "{message}"
+    );
+    assert!(
+        message.contains("No archive files were modified"),
+        "{message}"
+    );
+    assert_eq!(all_files(&project.archive).len(), 2);
+
+    let db = PlanDb::open(&project.settings.plan_db_path.clone().unwrap()).unwrap();
+    let session = db.current_session().unwrap().unwrap();
+    assert_eq!(session.status, SessionStatus::Active);
+    assert_eq!(db.counts(session.id).unwrap().applied, 0);
+}
+
+#[test]
+fn insert_only_plan_does_not_need_a_writable_trash_folder() {
+    let project = TestProject::new();
+    write_file(
+        &project.input.join("photo.png"),
+        &encode_png(&test_image(140, 100), None),
+    );
+    run_import(&project);
+
+    let bad_trash = project.dir.path().join("trash-is-a-file");
+    std::fs::write(&bad_trash, b"not a directory").unwrap();
+    let mut settings = project.settings.clone();
+    settings.trash_dir = Some(bad_trash);
+
+    let control = JobControl::new();
+    let (reporter, _rx) = ProgressReporter::channel();
+    let report = executor::apply_plan(&settings, true, &control, &reporter).unwrap();
+    assert_eq!(report.inserted, 1);
+    assert!(find_named(&project.archive, "photo.png").is_some());
+}
+
+#[test]
+fn legacy_plan_from_the_old_grouping_algorithm_cannot_be_applied() {
+    let project = TestProject::new();
+    let plan_path = project.settings.plan_db_path.clone().unwrap();
+    let mut db = PlanDb::open(&plan_path).unwrap();
+    db.create_session(
+        SessionMode::Import,
+        &project.input.to_string_lossy(),
+        &project.archive.to_string_lossy(),
+        "{}",
+    )
+    .unwrap();
+    drop(db);
+
+    let control = JobControl::new();
+    let (reporter, _rx) = ProgressReporter::channel();
+    let err = executor::apply_plan(&project.settings, true, &control, &reporter).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("older duplicate-grouping algorithm"),
+        "{err:#}"
+    );
+    assert!(all_files(&project.archive).is_empty());
 }
 
 #[test]

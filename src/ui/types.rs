@@ -132,6 +132,10 @@ impl PlanView {
         )
     }
 
+    pub(crate) fn is_legacy_grouping(&self) -> bool {
+        !self.session.uses_current_grouping()
+    }
+
     pub(crate) fn keeper_path<'a>(&self, group: &'a DuplicateGroup) -> Option<&'a str> {
         group
             .keeper_path
@@ -151,7 +155,7 @@ impl PlanView {
         match group.kind {
             GroupKind::Exact => format!("Exact duplicate · {name}"),
             GroupKind::Perceptual => format!(
-                "{:.0}% similar · {name} ({} files)",
+                "≥{:.1}% pairwise · {name} ({} files)",
                 group.similarity,
                 members.len()
             ),

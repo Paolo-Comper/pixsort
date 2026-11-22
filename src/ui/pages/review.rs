@@ -45,6 +45,25 @@ pub(crate) fn show(
         return None;
     };
 
+    if plan.is_legacy_grouping() {
+        egui::Frame::new()
+            .fill(BAD.gamma_multiply(0.15))
+            .stroke(egui::Stroke::new(1.0, BAD))
+            .corner_radius(6)
+            .inner_margin(10)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "This session was created with the old unbounded grouping algorithm. \
+                         Decisions are disabled because its groups may mix unrelated photographs. \
+                         Discard the session from “Planned modifications” and run Archive analysis again.",
+                    )
+                    .color(BAD),
+                );
+            });
+        return None;
+    }
+
     let groups: Vec<&crate::model::DuplicateGroup> = plan
         .duplicate_groups()
         .filter(|g| state.show_decided || g.needs_decision() || g.state == GroupState::Auto)
@@ -245,6 +264,18 @@ fn show_group(
             widgets::badge(ui, "Exact pixel duplicate", GOOD);
         }
     });
+    if members.len() > 8 {
+        ui.label(
+            RichText::new(format!(
+                "This group contains {} files. Check that they really are versions of the same \
+                 photograph. A decision applies to the whole group; “Keep both” and “Ignore match” \
+                 keep every version.",
+                members.len()
+            ))
+            .color(WARN)
+            .size(12.0),
+        );
+    }
     ui.add_space(4.0);
 
     // Alternative selector for groups with more than two members.

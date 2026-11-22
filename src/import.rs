@@ -127,7 +127,7 @@ pub fn run_import(
         SessionMode::Import,
         &input_dir.to_string_lossy(),
         &dest_dir.to_string_lossy(),
-        &serde_json::to_string(settings).unwrap_or_else(|_| "{}".into()),
+        &settings.session_settings_json(),
     )?;
     summary.session_id = session_id;
     plan_db

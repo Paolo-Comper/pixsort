@@ -36,7 +36,7 @@ jobs ─────────── import / analysis
 | `db::index_db` | Database A: operational image index and resumable scan state. |
 | `db::plan_db` | Database B: sessions, groups, members, decisions and plan items. |
 | `scan` | Directory enumeration, cache-aware parallel indexing, progress. |
-| `compare` | Exact hash grouping, BK-tree perceptual candidate search, union-find. |
+| `compare` | Exact hash classes, BK-tree perceptual candidate search, bounded complete-linkage grouping. |
 | `recommend` | Explainable keeper scoring. |
 | `planner` | Groups → final-state plan items, destination naming, review decisions. |
 | `import` / `analysis` | Workflow orchestration. |
@@ -96,7 +96,7 @@ can no longer trigger a silent regeneration.
 4. Load indexed photos. Group exact pixel duplicates first (hash map).
 5. Build BK-trees of archive and input pHashes; query only the input side, so
    archive photos are never compared with each other during import.
-6. Union-find clusters; create persisted groups and a metadata recommendation.
+6. Merge exact classes with bounded complete-linkage clustering (strongest edges first, every pair within the review radius, hard group-size cap); create persisted groups and a metadata recommendation.
 7. Classify each input photo as new, exact duplicate, probable or ambiguous.
 8. Create a session and groups, then rebuild final-state plan items.
 9. Stop before any filesystem modification.
@@ -110,7 +110,7 @@ be regenerated from the database after a restart without re-running comparison.
 2. Collapse exact-pixel classes.
 3. Build a BK-tree over one representative per exact class and query it with the
    review radius.
-4. Union classes, compute the lowest cross-class distance per group.
+4. Merge classes with the same bounded complete-linkage rule and compute the worst cross-class distance per group.
 5. Persist groups and generate a plan; nothing is modified until approval.
 
 No image is decoded during comparison. The index is the only input.
@@ -123,9 +123,17 @@ The pHash is 63 bits. Similarity is:
 similarity_percent = (1 - hamming_distance / 63) × 100
 ```
 
-Default thresholds: probable at 95% (distance ≤ 3), review at 70%
-(distance ≤ 19). Thresholds are configurable in Settings and converted with the
-same formula. See [policies.md](policies.md).
+Default thresholds: probable at 95% (distance ≤ 3), grouping/review at 85%
+(distance ≤ 9), and a hard cap of 10 photographs per perceptual group. The
+thresholds and cap are configurable in Settings. The original proposal used 70%
+for review, but at that radius a transitive chain of weak matches can merge
+hundreds of unrelated photos; 85% is the conservative default, and grouped
+matches must be mutually coherent at the radius. See
+[policies.md](policies.md).
+
+A plan session records the grouping-policy version that produced it. Sessions
+created before the bounded complete-linkage algorithm (or by hand) are detected
+and refused for review/apply; they must be discarded and the analysis rerun.
 
 ## Threading and responsiveness
 

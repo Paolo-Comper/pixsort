@@ -87,14 +87,35 @@ fn plan_contents(
     ui: &mut Ui,
     action: &mut Option<PlanAction>,
 ) {
+    let legacy_grouping = plan.is_legacy_grouping();
     let unresolved_groups = plan.unresolved_reviews();
     let review_items = plan.review_items();
     let has_work = plan.counts.pending + plan.counts.blocked + plan.counts.failed > 0;
     let can_apply = job.is_none()
         && plan.is_active()
+        && !legacy_grouping
         && unresolved_groups == 0
         && review_items == 0
         && has_work;
+
+    if legacy_grouping {
+        egui::Frame::new()
+            .fill(BAD.gamma_multiply(0.15))
+            .stroke(egui::Stroke::new(1.0, BAD))
+            .corner_radius(6)
+            .inner_margin(10)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "This session was created with the old unbounded grouping algorithm. \
+                         Its groups may contain unrelated photographs, so applying it is disabled. \
+                         Discard this session below and run Archive analysis again.",
+                    )
+                    .color(BAD),
+                );
+            });
+        ui.add_space(6.0);
+    }
 
     ui.horizontal_wrapped(|ui| {
         widgets::stat_card(
@@ -191,7 +212,9 @@ fn plan_contents(
         };
         if ui
             .add_enabled(can_apply, egui::Button::new(apply_label))
-            .on_disabled_hover_text(if unresolved_groups > 0 || review_items > 0 {
+            .on_disabled_hover_text(if legacy_grouping {
+                "This session was created by an older grouping algorithm; discard and rerun analysis."
+            } else if unresolved_groups > 0 || review_items > 0 {
                 "Resolve all review groups first."
             } else if !has_work {
                 "There is nothing left to apply."
@@ -265,17 +288,32 @@ fn plan_contents(
                         if group.needs_decision() {
                             widgets::badge(ui, "unresolved", WARN);
                         }
-                        if let Some(keeper) = keeper {
+                        if group.needs_decision() {
+                            if let Some(keeper) = keeper {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} files · recommended {} · not decided yet",
+                                        members.len(),
+                                        keeper.filename()
+                                    ))
+                                    .size(12.0),
+                                );
+                            }
+                        } else if let Some(keeper) = keeper {
                             ui.label(
                                 RichText::new(format!(
-                                    "keep {} (1 of {} files)",
+                                    "keep {} · {} other file(s) will not remain",
                                     keeper.filename(),
-                                    members.len()
+                                    members.len().saturating_sub(1)
                                 ))
                                 .size(12.0),
                             );
                         } else if group.state == crate::model::GroupState::Ignored {
-                            ui.label(RichText::new("keep every version").size(12.0).color(MUTED));
+                            ui.label(
+                                RichText::new("keep every version (group ignored)")
+                                    .size(12.0)
+                                    .color(MUTED),
+                            );
                         }
                     });
                 }

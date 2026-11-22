@@ -1,6 +1,19 @@
 //! Duplicate detection: exact pixel hashes plus a BK-tree over perceptual
 //! hashes.
 //!
+//! # Grouping policy
+//!
+//! Exact pixel matches form classes directly. Perceptual grouping is *not*
+//! single-linkage: that would let a chain of weak matches (A≈B, B≈C) merge
+//! hundreds of unrelated photos even when A and C are not similar.
+//!
+//! Instead, exact classes are merged only while the resulting group stays
+//! **complete-linkage coherent**: every pair of classes must be within the
+//! configured review radius, and the group is hard-capped in size. Candidates
+//! are processed strongest-first, so the most similar matches form groups
+//! before weaker ones. Remaining weak candidates are left as new photographs
+//! or separate groups; they are never transitively absorbed.
+//!
 //! No image decoding happens here. Candidate search is pure 63-bit hash
 //! arithmetic, which is what makes archive analysis of tens of thousands of
 //! photographs practical.
@@ -38,7 +51,8 @@ pub struct PhotoCluster {
     /// Indices into `Comparison::photos`, sorted by path.
     pub members: Vec<usize>,
     pub kind: GroupKind,
-    /// Lowest Hamming distance between *different* pixel hashes in the group.
+    /// Worst (largest) Hamming distance between distinct exact-pixel classes
+    /// in the group. This is a conservative description of group cohesion.
     pub distance: u32,
     pub similarity: f32,
 }
@@ -47,6 +61,53 @@ impl PhotoCluster {
     pub fn is_exact(&self) -> bool {
         self.kind == GroupKind::Exact
     }
+}
+
+/// A set of photographs that share exactly the same normalized pixel hash.
+#[derive(Debug)]
+struct ExactClass {
+    photos: Vec<usize>,
+    phash: Option<u64>,
+    has_archive: bool,
+    has_input: bool,
+}
+
+fn build_exact_classes(photos: &[PhotoRecord], archive_len: usize) -> Vec<ExactClass> {
+    let mut by_hash: HashMap<&str, usize> = HashMap::new();
+    let mut classes: Vec<ExactClass> = Vec::new();
+    for (index, photo) in photos.iter().enumerate() {
+        let class_index = match photo
+            .pixel_hash
+            .as_deref()
+            .and_then(|hash| by_hash.get(hash).copied())
+        {
+            Some(class_index) => class_index,
+            None => {
+                let class_index = classes.len();
+                classes.push(ExactClass {
+                    photos: Vec::new(),
+                    phash: photo.phash,
+                    has_archive: false,
+                    has_input: false,
+                });
+                if let Some(hash) = photo.pixel_hash.as_deref() {
+                    by_hash.insert(hash, class_index);
+                }
+                class_index
+            }
+        };
+        let class = &mut classes[class_index];
+        if class.phash.is_none() {
+            class.phash = photo.phash;
+        }
+        if index < archive_len {
+            class.has_archive = true;
+        } else {
+            class.has_input = true;
+        }
+        class.photos.push(index);
+    }
+    classes
 }
 
 /// Group duplicates for an import run.
@@ -65,66 +126,12 @@ pub fn group_import(
     let archive_len = archive.len();
     let mut photos = archive;
     photos.extend(input);
-    let mut uf = UnionFind::new(photos.len());
-    let mut perceptual_edges: HashMap<(usize, usize), u32> = HashMap::new();
-    let review_distance = settings.review_distance();
-
-    // --- exact pixel duplicates ------------------------------------------
-    let mut by_hash: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, photo) in photos.iter().enumerate() {
-        if let Some(hash) = photo.pixel_hash.as_deref() {
-            by_hash.entry(hash).or_default().push(i);
-        }
-    }
-    for members in by_hash.values() {
-        if members.len() < 2 {
-            continue;
-        }
-        let touches_input = members.iter().any(|&i| i >= archive_len);
-        if touches_input {
-            for pair in members.windows(2) {
-                uf.union(pair[0], pair[1]);
-            }
-        }
-    }
-
-    // --- perceptual duplicates (only input as the query side) ------------
-    if review_distance > 0 {
-        let archive_hashes: Vec<(usize, u64)> = (0..archive_len)
-            .filter_map(|i| photos[i].phash.map(|h| (i, h)))
-            .collect();
-        let input_hashes: Vec<(usize, u64)> = (archive_len..photos.len())
-            .filter_map(|i| photos[i].phash.map(|h| (i, h)))
-            .collect();
-        let archive_tree = BkTree::new(archive_hashes);
-        let input_tree = BkTree::new(input_hashes.clone());
-        let mut found = Vec::new();
-        for &(i, hash) in &input_hashes {
-            found.clear();
-            archive_tree.search(hash, review_distance, &mut found);
-            for &(j, distance) in &found {
-                if photos[i].pixel_hash == photos[j].pixel_hash && photos[i].pixel_hash.is_some() {
-                    continue; // already an exact match
-                }
-                uf.union(i, j);
-                record_edge(&mut perceptual_edges, i, j, distance);
-            }
-            found.clear();
-            input_tree.search(hash, review_distance, &mut found);
-            for &(j, distance) in &found {
-                if i == j {
-                    continue;
-                }
-                if photos[i].pixel_hash == photos[j].pixel_hash && photos[i].pixel_hash.is_some() {
-                    continue;
-                }
-                uf.union(i, j);
-                record_edge(&mut perceptual_edges, i, j, distance);
-            }
-        }
-    }
-
-    let clusters = build_clusters(&photos, &mut uf, &perceptual_edges);
+    let classes = build_exact_classes(&photos, archive_len);
+    let edges = import_candidate_edges(&classes, settings.review_distance());
+    let mut clusters = cluster_classes(&photos, &classes, edges, settings);
+    // Import must not report archive-only duplicate groups: existing archive
+    // photographs are never compared with one another during a normal import.
+    clusters.retain(|cluster| cluster.members.iter().any(|&index| index >= archive_len));
     Comparison {
         photos,
         archive_len,
@@ -135,72 +142,10 @@ pub fn group_import(
 /// Group duplicates inside an existing archive. Every archive photograph is
 /// compared with every other via the BK-tree, but no image is decoded again.
 pub fn group_archive(photos: Vec<PhotoRecord>, settings: &Settings) -> Comparison {
-    let len = photos.len();
-    let archive_len = len;
-    let mut uf = UnionFind::new(len);
-    let mut perceptual_edges: HashMap<(usize, usize), u32> = HashMap::new();
-    let review_distance = settings.review_distance();
-
-    // Exact classes: all photos sharing a pixel hash.
-    let mut by_hash: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, photo) in photos.iter().enumerate() {
-        if let Some(hash) = photo.pixel_hash.as_deref() {
-            by_hash.entry(hash).or_default().push(i);
-        }
-    }
-    let mut representatives: Vec<usize> = Vec::new();
-    let mut class_of: Vec<Option<usize>> = vec![None; len];
-    for members in by_hash.values() {
-        for pair in members.windows(2) {
-            uf.union(pair[0], pair[1]);
-        }
-        let rep = members[0];
-        for &member in members {
-            class_of[member] = Some(rep);
-        }
-        representatives.push(rep);
-    }
-    // Photos without any pixel hash (should be none in an indexed archive)
-    // still take part, as their own class.
-    for i in 0..len {
-        if class_of[i].is_none() {
-            class_of[i] = Some(i);
-            representatives.push(i);
-        }
-    }
-
-    if review_distance > 0 {
-        let rep_hashes: Vec<(usize, u64)> = representatives
-            .iter()
-            .filter_map(|&i| photos[i].phash.map(|h| (i, h)))
-            .collect();
-        let tree = BkTree::new(rep_hashes.clone());
-        let mut found = Vec::new();
-        for &(i, hash) in &rep_hashes {
-            found.clear();
-            tree.search(hash, review_distance, &mut found);
-            for &(j, distance) in &found {
-                if i == j {
-                    continue;
-                }
-                // Different exact classes only; equal hashes are already merged.
-                let same_pixels = match (
-                    photos[i].pixel_hash.as_deref(),
-                    photos[j].pixel_hash.as_deref(),
-                ) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                };
-                if same_pixels {
-                    continue;
-                }
-                uf.union(i, j);
-                record_edge(&mut perceptual_edges, i, j, distance);
-            }
-        }
-    }
-
-    let clusters = build_clusters(&photos, &mut uf, &perceptual_edges);
+    let archive_len = photos.len();
+    let classes = build_exact_classes(&photos, archive_len);
+    let edges = archive_candidate_edges(&classes, settings.review_distance());
+    let clusters = cluster_classes(&photos, &classes, edges, settings);
     Comparison {
         photos,
         archive_len,
@@ -208,7 +153,68 @@ pub fn group_archive(photos: Vec<PhotoRecord>, settings: &Settings) -> Compariso
     }
 }
 
-fn record_edge(edges: &mut HashMap<(usize, usize), u32>, a: usize, b: usize, distance: u32) {
+fn import_candidate_edges(classes: &[ExactClass], radius: u32) -> Vec<(u32, usize, usize)> {
+    let archive_entries: Vec<(usize, u64)> = classes
+        .iter()
+        .enumerate()
+        .filter(|(_, class)| class.has_archive)
+        .filter_map(|(index, class)| class.phash.map(|hash| (index, hash)))
+        .collect();
+    let input_entries: Vec<(usize, u64)> = classes
+        .iter()
+        .enumerate()
+        .filter(|(_, class)| class.has_input)
+        .filter_map(|(index, class)| class.phash.map(|hash| (index, hash)))
+        .collect();
+    let archive_tree = BkTree::new(archive_entries);
+    let input_tree = BkTree::new(input_entries.clone());
+
+    let mut edges: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut found = Vec::new();
+    for &(input_class, hash) in &input_entries {
+        found.clear();
+        archive_tree.search(hash, radius, &mut found);
+        for &(archive_class, distance) in &found {
+            if archive_class != input_class {
+                add_edge(&mut edges, input_class, archive_class, distance);
+            }
+        }
+        found.clear();
+        input_tree.search(hash, radius, &mut found);
+        for &(other_class, distance) in &found {
+            if other_class != input_class {
+                add_edge(&mut edges, input_class, other_class, distance);
+            }
+        }
+    }
+    sorted_edges(edges)
+}
+
+fn archive_candidate_edges(classes: &[ExactClass], radius: u32) -> Vec<(u32, usize, usize)> {
+    let entries: Vec<(usize, u64)> = classes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, class)| class.phash.map(|hash| (index, hash)))
+        .collect();
+    let tree = BkTree::new(entries.clone());
+    let mut edges: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut found = Vec::new();
+    for &(class_index, hash) in &entries {
+        found.clear();
+        tree.search(hash, radius, &mut found);
+        for &(other, distance) in &found {
+            if other > class_index {
+                add_edge(&mut edges, class_index, other, distance);
+            }
+        }
+    }
+    sorted_edges(edges)
+}
+
+fn add_edge(edges: &mut HashMap<(usize, usize), u32>, a: usize, b: usize, distance: u32) {
+    if a == b {
+        return;
+    }
     let key = (a.min(b), a.max(b));
     let entry = edges.entry(key).or_insert(distance);
     if distance < *entry {
@@ -216,62 +222,109 @@ fn record_edge(edges: &mut HashMap<(usize, usize), u32>, a: usize, b: usize, dis
     }
 }
 
-fn build_clusters(
+fn sorted_edges(edges: HashMap<(usize, usize), u32>) -> Vec<(u32, usize, usize)> {
+    let mut edges: Vec<(u32, usize, usize)> = edges
+        .into_iter()
+        .map(|((a, b), distance)| (distance, a, b))
+        .collect();
+    edges.sort_unstable();
+    edges
+}
+
+fn cluster_classes(
     photos: &[PhotoRecord],
-    uf: &mut UnionFind,
-    perceptual_edges: &HashMap<(usize, usize), u32>,
+    classes: &[ExactClass],
+    edges: Vec<(u32, usize, usize)>,
+    settings: &Settings,
 ) -> Vec<PhotoCluster> {
-    let mut buckets: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..photos.len() {
-        if photos[i].phash.is_none() {
+    let class_count = classes.len();
+    if class_count == 0 {
+        return Vec::new();
+    }
+    let radius = settings.review_distance();
+    let max_members = settings.max_group_members.max(2);
+
+    let mut parent: Vec<usize> = (0..class_count).collect();
+    let mut rank: Vec<u8> = vec![0; class_count];
+    let mut sizes: Vec<usize> = classes.iter().map(|c| c.photos.len()).collect();
+    let mut reps: Vec<Vec<u64>> = classes
+        .iter()
+        .map(|c| c.phash.into_iter().collect())
+        .collect();
+
+    // Strongest candidate edges first. A merge is allowed only when the
+    // combined group is complete-linkage coherent at the review radius and
+    // within the size limit.
+    for (_, a, b) in edges {
+        let root_a = dsu_find(&mut parent, a);
+        let root_b = dsu_find(&mut parent, b);
+        if root_a == root_b {
             continue;
         }
-        let root = uf.find(i);
-        buckets.entry(root).or_default().push(i);
+        if sizes[root_a] + sizes[root_b] > max_members {
+            continue;
+        }
+        let coherent = reps[root_a].iter().all(|&hash_a| {
+            reps[root_b]
+                .iter()
+                .all(|&hash_b| phash_distance(hash_a, hash_b) <= radius)
+        });
+        if !coherent {
+            continue;
+        }
+        let (keep, gone) = if rank[root_a] >= rank[root_b] {
+            (root_a, root_b)
+        } else {
+            (root_b, root_a)
+        };
+        parent[gone] = keep;
+        if rank[root_a] == rank[root_b] {
+            rank[keep] = rank[keep].saturating_add(1);
+        }
+        sizes[keep] += sizes[gone];
+        let moved = std::mem::take(&mut reps[gone]);
+        reps[keep].extend(moved);
+    }
+
+    let mut by_root: HashMap<usize, Vec<usize>> = HashMap::new();
+    for class_index in 0..class_count {
+        let root = dsu_find(&mut parent, class_index);
+        by_root.entry(root).or_default().push(class_index);
     }
 
     let mut clusters = Vec::new();
-    for members in buckets.into_values() {
-        if members.len() < 2 {
+    for mut class_ids in by_root.into_values() {
+        class_ids.sort_unstable();
+        let mut members: Vec<usize> = class_ids
+            .iter()
+            .flat_map(|&class_index| classes[class_index].photos.iter().copied())
+            .collect();
+        if members.is_empty() {
             continue;
         }
-        let first_hash = photos[members[0]].pixel_hash.as_deref();
-        let exact = first_hash.is_some()
-            && members
-                .iter()
-                .all(|&i| photos[i].pixel_hash.as_deref() == first_hash);
+        let exact = class_ids.len() == 1;
+        if exact && members.len() < 2 {
+            continue; // a lone photograph is not a group
+        }
         let distance = if exact {
             0
         } else {
-            let set: std::collections::HashSet<usize> = members.iter().copied().collect();
-            let mut min = PHASH_BITS;
-            for (&(a, b), &d) in perceptual_edges {
-                if set.contains(&a) && set.contains(&b) {
-                    min = min.min(d);
-                }
-            }
-            // Fallback: derive from pairwise comparison when an edge was lost
-            // (e.g. a cluster rooted through exact links). These groups are
-            // tiny in practice.
-            if min == PHASH_BITS && members.len() <= 64 {
-                for a in 0..members.len() {
-                    for b in a + 1..members.len() {
-                        if let (Some(ha), Some(hb)) =
-                            (photos[members[a]].phash, photos[members[b]].phash)
-                        {
-                            if photos[members[a]].pixel_hash != photos[members[b]].pixel_hash {
-                                min = min.min(phash_distance(ha, hb));
-                            }
-                        }
+            let mut worst = 0u32;
+            for (position, &left) in class_ids.iter().enumerate() {
+                let Some(hash_left) = classes[left].phash else {
+                    continue;
+                };
+                for &right in &class_ids[position + 1..] {
+                    if let Some(hash_right) = classes[right].phash {
+                        worst = worst.max(phash_distance(hash_left, hash_right));
                     }
                 }
             }
-            min
+            worst.min(PHASH_BITS)
         };
-        let mut sorted = members;
-        sorted.sort_by(|&a, &b| photos[a].path.cmp(&photos[b].path));
+        members.sort_by(|&a, &b| photos[a].path.cmp(&photos[b].path));
         clusters.push(PhotoCluster {
-            members: sorted,
+            members,
             kind: if exact {
                 GroupKind::Exact
             } else {
@@ -285,46 +338,18 @@ fn build_clusters(
     clusters
 }
 
-// ---------------------------------------------------------------------------
-// Union-find
-// ---------------------------------------------------------------------------
-
-struct UnionFind {
-    parent: Vec<usize>,
-    rank: Vec<u8>,
-}
-
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n).collect(),
-            rank: vec![0; n],
-        }
+fn dsu_find(parent: &mut [usize], start: usize) -> usize {
+    let mut root = start;
+    while parent[root] != root {
+        root = parent[root];
     }
-
-    fn find(&mut self, mut x: usize) -> usize {
-        while self.parent[x] != x {
-            self.parent[x] = self.parent[self.parent[x]];
-            x = self.parent[x];
-        }
-        x
+    let mut current = start;
+    while parent[current] != current {
+        let next = parent[current];
+        parent[current] = root;
+        current = next;
     }
-
-    fn union(&mut self, a: usize, b: usize) {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra == rb {
-            return;
-        }
-        match self.rank[ra].cmp(&self.rank[rb]) {
-            std::cmp::Ordering::Less => self.parent[ra] = rb,
-            std::cmp::Ordering::Greater => self.parent[rb] = ra,
-            std::cmp::Ordering::Equal => {
-                self.parent[rb] = ra;
-                self.rank[ra] += 1;
-            }
-        }
-    }
+    root
 }
 
 // ---------------------------------------------------------------------------
@@ -448,9 +473,14 @@ mod tests {
     }
 
     fn settings(review_pct: f32) -> Settings {
+        settings_with_cap(review_pct, 20)
+    }
+
+    fn settings_with_cap(review_pct: f32, max_group_members: usize) -> Settings {
         let mut settings = Settings::default();
         settings.review_similarity_pct = review_pct;
         settings.probable_similarity_pct = 95.0;
+        settings.max_group_members = max_group_members;
         settings
     }
 
@@ -516,5 +546,79 @@ mod tests {
         assert_eq!(comparison.clusters.len(), 1);
         assert_eq!(comparison.clusters[0].kind, GroupKind::Exact);
         assert_eq!(comparison.clusters[0].members.len(), 2);
+    }
+
+    #[test]
+    fn weak_chains_are_not_transitively_merged() {
+        // h0--9--h1--9--h2, but h0--18--h2. At the 85% radius (distance <= 9)
+        // h0 and h1 may group, but h2 must not be pulled in through h1.
+        let s = settings(85.0);
+        let h0 = 0u64;
+        let h1 = (1u64 << 9) - 1;
+        let h2 = (1u64 << 18) - 1;
+        let photos = vec![
+            photo("/archive/a.jpg", "aaaa", h0),
+            photo("/archive/b.jpg", "bbbb", h1),
+            photo("/archive/c.jpg", "cccc", h2),
+        ];
+        let comparison = group_archive(photos, &s);
+        assert_eq!(comparison.clusters.len(), 1);
+        assert_eq!(comparison.clusters[0].members.len(), 2);
+        assert!(!comparison.clusters[0].members.contains(&2));
+    }
+
+    #[test]
+    fn group_size_cap_splits_dense_clusters() {
+        let s = settings_with_cap(85.0, 3);
+        let photos: Vec<PhotoRecord> = (0..6)
+            .map(|i| photo(&format!("/archive/{i}.jpg"), &format!("hash{i}"), 0))
+            .collect();
+        let comparison = group_archive(photos, &s);
+        assert_eq!(comparison.clusters.len(), 2);
+        for cluster in &comparison.clusters {
+            assert!(cluster.members.len() <= 3, "{:?}", cluster.members);
+        }
+    }
+
+    #[test]
+    fn default_review_radius_is_conservative() {
+        // Distance 12 is 81%, inside the old 70% review band but below the
+        // conservative 85% grouping default.
+        let h0 = 0u64;
+        let h1 = (1u64 << 12) - 1;
+        let make = || {
+            vec![
+                photo("/archive/a.jpg", "aaaa", h0),
+                photo("/archive/b.jpg", "bbbb", h1),
+            ]
+        };
+        let conservative = Settings::default();
+        assert!(group_archive(make(), &conservative).clusters.is_empty());
+        let loose = settings(70.0);
+        assert_eq!(group_archive(make(), &loose).clusters.len(), 1);
+    }
+
+    #[test]
+    fn import_never_groups_archive_only_photographs() {
+        let s = settings(85.0);
+        let archive = vec![
+            photo("/archive/a.jpg", "aaaa", 0),
+            photo("/archive/b.jpg", "bbbb", 0b111),
+        ];
+        let input = vec![photo("/in/x.jpg", "cccc", (1u64 << PHASH_BITS) - 1)];
+        let comparison = group_import(archive, input, &s);
+        assert!(comparison.clusters.is_empty());
+    }
+
+    #[test]
+    fn import_does_not_report_archive_only_exact_duplicates() {
+        let s = settings(85.0);
+        let archive = vec![
+            photo("/archive/a.jpg", "samepixels", 0),
+            photo("/archive/b.jpg", "samepixels", 0),
+        ];
+        let input = vec![photo("/in/x.jpg", "different", (1u64 << PHASH_BITS) - 1)];
+        let comparison = group_import(archive, input, &s);
+        assert!(comparison.clusters.is_empty());
     }
 }

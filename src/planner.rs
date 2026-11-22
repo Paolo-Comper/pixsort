@@ -211,6 +211,13 @@ pub fn rebuild_plan(
         );
     }
 
+    if !session.uses_current_grouping() {
+        bail!(
+            "This plan was created with an older duplicate-grouping algorithm (before \
+             complete-linkage groups and size limits). Applying or editing it would be unsafe. \
+             Discard this session and run Archive analysis again."
+        );
+    }
     let mut groups = db.load_groups(session.id)?;
     groups.sort_by_key(|g| g.id);
     let mut members: HashMap<i64, Vec<PhotoRecord>> = HashMap::new();

@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::distance_for_similarity;
 
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
+
+/// Version of the duplicate-grouping algorithm that produced a plan session.
+/// Sessions without this marker were produced by the old transitive
+/// union-find grouping and must be rerun; their groups can be unsafe.
+pub const GROUPING_VERSION: u32 = 2;
 const SETTINGS_FILE: &str = "settings.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,8 +40,12 @@ pub struct Settings {
 
     /// Similarity (percent) at or above which a match is "probable duplicate".
     pub probable_similarity_pct: f32,
-    /// Similarity (percent) at or above which a match is worth reviewing.
+    /// Similarity (percent) at or above which a match is considered for a
+    /// perceptual duplicate group. Weak candidates are not merged transitively.
     pub review_similarity_pct: f32,
+    /// Hard upper bound for photographs in one perceptual group. Exact-pixel
+    /// groups are not capped because their identity is verified.
+    pub max_group_members: usize,
 
     /// Use the filesystem modification time as a year fallback when no EXIF
     /// timestamp exists. When disabled such photos go to `Unknown/`.
@@ -59,7 +68,12 @@ impl Default for Settings {
             trash_dir: None,
             worker_threads: default_workers(),
             probable_similarity_pct: 95.0,
-            review_similarity_pct: 70.0,
+            // Conservative default: 85% (Hamming distance ≤ 9). The original
+            // proposal was 70%, but at 70% a transitive chain of weak matches
+            // can merge hundreds of unrelated photos. Users can lower it in
+            // Settings if they want a wider review net.
+            review_similarity_pct: 85.0,
+            max_group_members: 10,
             use_filesystem_year: true,
             thumbnail_max_dim: 1200,
         }
@@ -108,6 +122,43 @@ pub fn config_dir() -> PathBuf {
 
 pub fn settings_path() -> PathBuf {
     config_dir().join(SETTINGS_FILE)
+}
+
+/// A user-writable trash location on local storage. Useful when the archive
+/// lives on a read-only or restricted network mount: Pixsort can move files
+/// across filesystems with a verified copy.
+pub fn local_trash_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+            .unwrap_or_else(|| config_dir());
+        return base.join("Pixsort").join("trash");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("Pixsort")
+                .join("trash");
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("pixsort").join("trash");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("pixsort")
+            .join("trash");
+    }
+    config_dir().join("trash")
 }
 
 impl Settings {
@@ -161,6 +212,13 @@ impl Settings {
 
     /// Enforces invariants after loading or editing.
     pub fn normalize(&mut self) {
+        // One-time migration: version 1 used a 70% review default, which
+        // allowed unbounded transitive perceptual groups. Move an untouched
+        // old default to the conservative 85% value. A deliberately lowered
+        // threshold can be set again in Settings.
+        if self.schema_version < 2 && (self.review_similarity_pct - 70.0).abs() < 0.01 {
+            self.review_similarity_pct = 85.0;
+        }
         self.schema_version = SETTINGS_VERSION;
         self.worker_threads = self.worker_threads.clamp(1, 64);
         self.probable_similarity_pct = self.probable_similarity_pct.clamp(1.0, 100.0);
@@ -169,6 +227,7 @@ impl Settings {
             self.review_similarity_pct = self.probable_similarity_pct;
         }
         self.thumbnail_max_dim = self.thumbnail_max_dim.clamp(256, 4096);
+        self.max_group_members = self.max_group_members.clamp(2, 500);
     }
 
     pub fn probable_distance(&self) -> u32 {
@@ -183,12 +242,14 @@ impl Settings {
     pub fn threshold_hint(&self) -> String {
         format!(
             "pHashes are {bits}-bit. {p:.0}% = Hamming distance ≤ {pd}; {r:.0}% = ≤ {rd}. \
-             Similarity = 1 − distance/{bits}, shown as a heuristic indicator.",
+             Similarity = 1 − distance/{bits}, shown as a heuristic indicator. \
+             Groups must be mutually coherent at this radius and are capped at {cap} photographs.",
             bits = crate::model::PHASH_BITS,
             p = self.probable_similarity_pct,
             pd = self.probable_distance(),
             r = self.review_similarity_pct,
             rd = self.review_distance(),
+            cap = self.max_group_members,
         )
     }
 
@@ -308,6 +369,11 @@ impl Settings {
                 "The review threshold must not be higher than the probable-duplicate threshold.",
             ));
         }
+        if !(2..=500).contains(&self.max_group_members) {
+            out.push(ValidationIssue::error(
+                "The perceptual group size limit must be between 2 and 500.",
+            ));
+        }
 
         out
     }
@@ -373,14 +439,30 @@ impl Settings {
         Ok(())
     }
 
+    /// Serializes settings for a plan session, including the grouping policy
+    /// version so old sessions can be detected safely after an upgrade.
+    pub fn session_settings_json(&self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.insert(
+                    "pixsort_grouping_version".into(),
+                    serde_json::Value::from(GROUPING_VERSION),
+                );
+                serde_json::to_string(&map).unwrap_or_else(|_| "{}".into())
+            }
+            _ => "{}".into(),
+        }
+    }
+
     pub fn summary(&self) -> String {
         format!(
-            "{} worker threads · probable ≥ {:.0}% (d ≤ {}) · review ≥ {:.0}% (d ≤ {})",
+            "{} worker threads · probable ≥ {:.0}% (d ≤ {}) · grouping/review ≥ {:.0}% (d ≤ {}) · max {} per group",
             self.worker_threads,
             self.probable_similarity_pct,
             self.probable_distance(),
             self.review_similarity_pct,
-            self.review_distance()
+            self.review_distance(),
+            self.max_group_members
         )
     }
 }
@@ -488,8 +570,25 @@ mod tests {
     fn thresholds_convert() {
         let s = Settings::default();
         assert_eq!(s.probable_distance(), 3);
-        assert_eq!(s.review_distance(), 19);
+        assert_eq!(s.review_distance(), 9);
         assert!(s.threshold_hint().contains("Hamming"));
+    }
+
+    #[test]
+    fn old_settings_default_is_migrated() {
+        let mut settings = Settings::default();
+        settings.schema_version = 1;
+        settings.review_similarity_pct = 70.0;
+        settings.normalize();
+        assert_eq!(settings.review_similarity_pct, 85.0);
+        assert_eq!(settings.schema_version, SETTINGS_VERSION);
+
+        // A deliberately non-default old value is preserved.
+        let mut settings = Settings::default();
+        settings.schema_version = 1;
+        settings.review_similarity_pct = 80.0;
+        settings.normalize();
+        assert_eq!(settings.review_similarity_pct, 80.0);
     }
 
     #[test]

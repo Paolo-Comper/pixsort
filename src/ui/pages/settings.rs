@@ -33,6 +33,7 @@ pub(crate) fn show(app: &mut PixsortApp, ui: &mut Ui) {
             ui.add_space(4.0);
 
             widgets::section_title(ui, "Locations");
+            let mut use_local_trash = false;
             egui::Frame::group(ui.style())
                 .inner_margin(12)
                 .show(ui, |ui| {
@@ -73,14 +74,41 @@ pub(crate) fn show(app: &mut PixsortApp, ui: &mut Ui) {
                         ui,
                         "Trash folder",
                         app.settings.effective_trash_dir().as_deref(),
-                        "Discarded versions are moved here and never deleted.",
+                        "Discarded versions are moved here and never deleted. It must be writable; it may be on a different disk.",
                         &mut pick,
                         PickTarget::Trash,
                     );
+                    ui.horizontal(|ui| {
+                        ui.add_space(150.0);
+                        let local = crate::config::local_trash_dir();
+                        if ui
+                            .add_enabled(
+                                app.job.is_none(),
+                                egui::Button::new("Use local trash folder"),
+                            )
+                            .on_hover_text(format!(
+                                "Use {} — a user-writable folder on local storage.                                  Files are moved across filesystems with a verified copy.",
+                                local.display()
+                            ))
+                            .clicked()
+                        {
+                            use_local_trash = true;
+                        }
+                        ui.label(
+                            RichText::new(local.display().to_string())
+                                .color(MUTED)
+                                .monospace()
+                                .size(10.5),
+                        );
+                    });
                     if let Some(target) = pick {
                         app.start_picker(target);
                     }
                 });
+            if use_local_trash {
+                app.settings.trash_dir = Some(crate::config::local_trash_dir());
+                app.save_settings();
+            }
 
             ui.add_space(6.0);
             widgets::section_title(ui, "Processing");
@@ -134,20 +162,35 @@ pub(crate) fn show(app: &mut PixsortApp, ui: &mut Ui) {
                     let mut review = app.settings.review_similarity_pct;
                     if ui
                         .add(
-                            egui::Slider::new(&mut review, 30.0..=100.0)
+                            egui::Slider::new(&mut review, 50.0..=100.0)
                                 .suffix("%")
-                                .text("Worth reviewing at or above"),
+                                .text("Group / review at or above"),
                         )
                         .changed()
                     {
                         app.settings.review_similarity_pct = review;
+                    }
+                    let mut max_members = app.settings.max_group_members as u32;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut max_members, 2..=100)
+                                .text("Maximum photographs per perceptual group"),
+                        )
+                        .changed()
+                    {
+                        app.settings.max_group_members = max_members as usize;
                     }
                     app.settings.normalize();
                     ui.label(RichText::new(app.settings.threshold_hint()).color(MUTED).size(12.0));
                     ui.label(
                         RichText::new(
                             "Similarity = 1 − Hamming distance / 63, converted from the 63-bit pHash. \
-                             These percentages are UI indicators, not statistically calibrated probabilities.",
+                             These percentages are UI indicators, not statistically calibrated probabilities. \
+                             Groups are complete-linkage coherent and size-capped: a weak chain of matches cannot \
+                             pull unrelated photographs into one group. The conservative 85% default avoids \
+                             transitive over-grouping; lower it only if you want a wider review net. \
+                             These settings affect the next scan/analysis; rerun Archive analysis \
+                             after changing them to regroup an existing plan.",
                         )
                         .color(MUTED)
                         .size(11.5),

@@ -3,6 +3,20 @@
 Data safety takes priority over aggressive automatic cleanup. The archive is
 read-only during scanning, comparison and review.
 
+## Grouping safety
+
+Duplicate grouping must not be allowed to drift through weak similarity chains.
+The comparator uses bounded complete-linkage clustering: every pair of exact
+classes inside a perceptual group must be within the configured review radius,
+and a group is capped at 10 photographs by default. Weak candidates are not
+transitively merged. Perceptual groups are always REVIEW operations until the
+user decides.
+
+Plans store the grouping-policy version that created them. A session produced by
+the old unbounded grouping algorithm is detected and refused for decisions and
+execution; the safe action is to discard it (database files and photos are kept)
+and rerun Archive analysis.
+
 ## Explicit approval
 
 `executor::apply_plan` requires a `confirmed` argument. The GUI sets it only
@@ -62,6 +76,32 @@ The trash directory is configurable. The default is `pixsort-trash` as a sibling
 of the archive root (outside the archive). Trash paths preserve the archive's
 relative directory structure and get ` (1)` suffixes on collision. Files in
 trash are never deleted by Pixsort.
+
+The trash folder may be on a different filesystem from the archive (or even a
+local disk when the archive is a NAS). Cross-filesystem moves use the verified
+copy-and-remove procedure. Settings → Trash folder has a **Use local trash
+folder** shortcut that selects a user-writable local path.
+
+### Write-access preflight
+
+Before the first operation is executed, Pixsort checks every archive folder it
+will actually write to or remove files from, plus (when the plan contains
+REPLACE or MOVE_TO_TRASH) the trash folder. It creates and removes a private
+probe file in each. A move-only plan therefore needs write access to the source
+folders, not necessarily to the archive root. If a preflight fails, the session
+stays active, no plan item is marked running, and nothing is moved or copied.
+The error names the exact path and tells you which folder to fix.
+
+On a shared/server disk with `root:users` and setgid folders, the standard fix
+is to put your user in the owning group or grant a write ACL on the specific
+folders Pixsort needs. That is narrower than running the application as root.
+
+Pixsort deliberately does **not** invoke `sudo`/`pkexec` or run as root. A
+desktop photo application parses untrusted images and should not have root
+privileges; elevating the whole process would also make settings and database
+files root-owned. More importantly, privilege escalation cannot make a
+read-only/NAS mount writable. Fix the mount options or folder ownership, or put
+the trash on a writable local disk and keep the archive on a writable share.
 
 ## Interrupted execution and recovery
 

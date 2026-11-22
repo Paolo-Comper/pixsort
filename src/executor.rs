@@ -6,6 +6,7 @@
 //!   * `running` items from an interrupted run are reconciled on restart,
 //!   * the archive is only modified after the explicit approval flag.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -79,12 +80,43 @@ pub fn apply_plan(
             ),
         }
     }
+    if !session.uses_current_grouping() {
+        bail!(
+            "This plan was created with an older duplicate-grouping algorithm (before \
+             complete-linkage groups and size limits). It is not safe to apply. Discard this \
+             session and run Archive analysis again."
+        );
+    }
     plan.check_ready_to_apply(session.id)?;
-    std::fs::create_dir_all(&trash_root)
-        .with_context(|| format!("cannot create trash directory {}", trash_root.display()))?;
+    let pending = plan.load_pending_items(session.id)?;
+
+    // Preflight the write capabilities needed by the pending operations. This
+    // runs before the session is marked as applying and before anything could
+    // be moved to trash, so an unwritable folder cannot leave the archive
+    // partially modified. We check the directories actually touched by each
+    // operation rather than assuming the archive root is writable: a move-only
+    // plan needs write access to the source folders, not necessarily the root.
+    let (archive_dirs, needs_trash) = preflight_targets(&pending);
+    if needs_trash {
+        preflight_writable_directory(
+            &trash_root,
+            "trash folder",
+            "Choose a writable trash folder in Settings. It may be on a different disk: Pixsort \
+             uses a verified copy-and-remove when an atomic move is impossible. The built-in \
+             local trash folder is usually a safe choice.",
+        )?;
+    }
+    for dir in archive_dirs {
+        preflight_writable_directory(
+            &dir,
+            "archive folder",
+            "On a shared or server disk, add your user to the group that owns these folders or \
+             grant a write ACL on just the required folders. Running the whole application as \
+             root is not recommended and cannot bypass a read-only mount.",
+        )?;
+    }
     plan.set_session_status(session.id, crate::db::SessionStatus::Applying)?;
 
-    let pending = plan.load_pending_items(session.id)?;
     reporter.begin_phase("Applying modification plan");
     reporter.set_total(pending.len() as u64);
     reporter.log(format!(
@@ -288,6 +320,70 @@ fn execute_item(
         OpType::MoveToTrash => execute_trash(plan, index, dest_root, trash_root, item),
         OpType::Insert => execute_insert(plan, index, dest_root, item),
         OpType::Replace => execute_replace(plan, index, dest_root, trash_root, item),
+    }
+}
+
+/// Returns the archive directories that must be writable for the pending
+/// operations, plus whether the trash folder is needed.
+fn preflight_targets(pending: &[PlanItem]) -> (Vec<PathBuf>, bool) {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut needs_trash = false;
+    let mut add_parent = |path: Option<&str>| {
+        let Some(parent) = path.and_then(|value| Path::new(value).parent()) else {
+            return;
+        };
+        if seen.insert(parent.to_path_buf()) {
+            dirs.push(parent.to_path_buf());
+        }
+    };
+    for item in pending {
+        match item.op {
+            OpType::Insert => add_parent(item.dest_path.as_deref()),
+            OpType::Replace => {
+                add_parent(item.dest_path.as_deref());
+                add_parent(item.existing_path.as_deref());
+                needs_trash = true;
+            }
+            OpType::MoveToTrash => {
+                add_parent(
+                    item.existing_path
+                        .as_deref()
+                        .or(item.source_path.as_deref()),
+                );
+                needs_trash = true;
+            }
+            OpType::Skip | OpType::Review => {}
+        }
+    }
+    (dirs, needs_trash)
+}
+
+fn preflight_writable_directory(path: &Path, label: &str, hint: &str) -> Result<()> {
+    if let Err(err) = std::fs::create_dir_all(path) {
+        bail!(
+            "The {label} is not writable: {}\n{err}\n\nNo archive files were modified. {hint}",
+            path.display()
+        );
+    }
+    let probe = path.join(format!(".pixsort-write-test-{}", uuid::Uuid::new_v4()));
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    match result {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&probe);
+            bail!(
+                "The {label} is not writable: {}\n{err}\n\nNo archive files were modified. {hint}",
+                path.display()
+            );
+        }
     }
 }
 

@@ -93,6 +93,26 @@ pub struct PlanSession {
     pub created_at: i64,
     pub updated_at: i64,
     pub plan_dirty: bool,
+    pub settings_json: String,
+}
+
+impl PlanSession {
+    /// Version of the grouping algorithm that created this session. Older
+    /// sessions (or hand-made ones) return 0 and cannot be applied.
+    pub fn grouping_version(&self) -> u32 {
+        serde_json::from_str::<serde_json::Value>(&self.settings_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("pixsort_grouping_version")
+                    .and_then(|v| v.as_u64())
+            })
+            .unwrap_or(0) as u32
+    }
+
+    pub fn uses_current_grouping(&self) -> bool {
+        self.grouping_version() >= crate::config::GROUPING_VERSION
+    }
 }
 
 /// A group ready to be stored. Members are full index records.
@@ -301,7 +321,7 @@ impl PlanDb {
 
     pub fn latest_session(&self) -> Result<Option<PlanSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty
+            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty, settings_json
              FROM sessions ORDER BY id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query([])?;
@@ -316,7 +336,7 @@ impl PlanDb {
     /// otherwise the newest of any status (so reports remain visible).
     pub fn current_session(&self) -> Result<Option<PlanSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty
+            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty, settings_json
              FROM sessions
              ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'applying' THEN 1 ELSE 2 END,
                       id DESC
@@ -332,7 +352,7 @@ impl PlanDb {
 
     pub fn session(&self, id: i64) -> Result<Option<PlanSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty
+            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty, settings_json
              FROM sessions WHERE id=?1",
         )?;
         let mut rows = stmt.query([id])?;
@@ -807,7 +827,7 @@ impl PlanDb {
 
     pub fn recent_sessions(&self, limit: usize) -> Result<Vec<PlanSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty
+            "SELECT id, mode, input_dir, dest_dir, status, created_at, updated_at, plan_dirty, settings_json
              FROM sessions ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], map_session)?;
@@ -835,6 +855,7 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanSession> {
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
         plan_dirty: row.get::<_, i64>(7)? != 0,
+        settings_json: row.get(8)?,
     })
 }
 
@@ -940,6 +961,29 @@ mod tests {
         .unwrap();
         assert!(db.session(id).unwrap().unwrap().plan_dirty);
         db.integrity_check().unwrap();
+    }
+
+    #[test]
+    fn grouping_version_is_recorded_and_legacy_sessions_are_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = PlanDb::open(&dir.path().join("plan.sqlite")).unwrap();
+        let legacy = db
+            .create_session(SessionMode::Import, "/in", "/archive", "{}")
+            .unwrap();
+        assert!(!db.session(legacy).unwrap().unwrap().uses_current_grouping());
+        let current = db
+            .create_session(
+                SessionMode::Import,
+                "/in",
+                "/archive",
+                &crate::config::Settings::default().session_settings_json(),
+            )
+            .unwrap();
+        assert!(db
+            .session(current)
+            .unwrap()
+            .unwrap()
+            .uses_current_grouping());
     }
 
     #[test]

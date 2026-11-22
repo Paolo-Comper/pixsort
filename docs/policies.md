@@ -100,15 +100,45 @@ similarity_percent = (1 − distance / 63) × 100
 | 2 | 96.8% | probable |
 | 3 | 95.2% | probable |
 | 4 | 93.7% | review |
-| 10 | 84.1% | review |
-| 19 | 69.8% | review (boundary) |
+| 9 | 85.7% | review / group (default boundary) |
+| 10 | 84.1% | below default; review only if lowered |
+| 19 | 69.8% | review boundary only if threshold is lowered to 70% |
 | 20 | 68.3% | new photograph |
 
 Default thresholds:
 
 - **probable duplicate**: ≥ 95% (distance ≤ 3),
-- **worth reviewing**: ≥ 70% (distance ≤ 19),
-- below that: treated as a new photograph.
+- **perceptual group / review**: ≥ 85% (distance ≤ 9),
+- **hard group-size cap**: 10 photographs,
+- below 85%: treated as a new photograph by default.
+
+The specification's initial proposal used 70% for the review boundary. That is
+configurable and still available, but it is a very loose grouping edge: a chain
+of 70–85% matches can connect unrelated photographs even when the endpoints are
+not similar. Pixsort therefore defaults to a conservative 85% and limits group
+size. Users who want a wider net can lower the threshold in Settings, knowing
+that more candidates (and more false positives) will appear.
+
+### Grouping policy (important)
+
+Pixsort does **not** use single-linkage union-find at the review radius. It uses
+bounded **complete-linkage** clustering:
+
+1. Exact pixel hashes form exact classes (never split).
+2. Candidate edges between classes are collected with the BK-tree and sorted by
+   Hamming distance, strongest first.
+3. Two classes may merge only if every cross-class pair is within the review
+   radius, and the combined group is at most `max_group_members` photographs.
+4. A weak chain A≈B, B≈C can therefore never pull A and C into the same group
+   when A and C exceed the radius.
+5. Excess members form separate groups rather than one giant group.
+
+The group similarity displayed for a perceptual group is the **worst** link
+between its exact classes, not the best one, so the indicator is conservative.
+
+Plans record their grouping version. A plan made with the old unbounded
+algorithm is refused for review and execution; discard it and rerun the
+analysis.
 
 These percentages are **UI indicators, not calibrated probabilities**. Real
 pHash distances depend on content, resizing, compression and messaging-app
@@ -139,7 +169,8 @@ For each imported photograph:
 Exact groups are resolved automatically using the recommendation. Perceptual
 groups are always placed in manual review, even when probable, because the user
 has the final decision for perceptually similar photographs. A group may contain
-exact and perceptual links; the UI shows the full group.
+exact and perceptual links; the UI shows the full group. Perceptual groups are
+capped in size so one decision cannot silently affect hundreds of files.
 
 For an import, if the keeper is a new file and archive versions exist, the plan
 uses REPLACE (old copy → trash, new copy verified and inserted). If the keeper is
